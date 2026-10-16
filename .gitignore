@@ -10,3 +10,4 @@ DerivedData/
 ClaudeBuddy.app
 *.app
 .DS_Store
+*.zip

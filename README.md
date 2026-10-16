@@ -1,5 +1,10 @@
 # 🤖 ClaudeBuddy - Widget Flotante Nativo de Tokens para Mac
 
+[![Download Release](https://img.shields.io/github/v/release/josecd/ClaudeBuddy?label=Descargar%20v1.0.0&style=for-the-badge&color=007AFF)](https://github.com/josecd/ClaudeBuddy/releases/latest)
+
+> 🚀 **Descarga directa:** Puedes descargar la versión ya compilada lista para usar desde [GitHub Releases](https://github.com/josecd/ClaudeBuddy/releases/latest) sin necesidad de tener Xcode instalado.
+
+---
 Un compañero de escritorio flotante nativo de macOS (Swift + SwiftUI) que monitorea en tiempo real el uso de tokens de tus sesiones de **Claude Code** e interactúa con animaciones vivas según lo que Claude esté haciendo en la pantalla.
 
 ---
