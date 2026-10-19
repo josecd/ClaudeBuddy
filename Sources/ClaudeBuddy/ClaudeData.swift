@@ -23,6 +23,23 @@ public struct ClaudeUsageInfo: Sendable {
     public init() {}
 }
 
+// Direct Anthropic API structures
+struct KeychainOAuthPayload: Codable {
+    struct ClaudeAiOauth: Codable {
+        let accessToken: String?
+    }
+    let claudeAiOauth: ClaudeAiOauth?
+}
+
+struct AnthropicUsageResponse: Codable {
+    struct Window: Codable {
+        let utilization: Double?
+        let resets_at: String?
+    }
+    let five_hour: Window?
+    let seven_day: Window?
+}
+
 // Live usage structure from ~/.claude/live-usage.json
 struct LiveUsageFile: Codable {
     let five_hour: LiveWindow?

@@ -6,31 +6,136 @@ public class ClaudeMonitor: ObservableObject {
     @Published public var info: ClaudeUsageInfo = ClaudeUsageInfo()
     
     private var timer: Timer?
+    private var apiTimer: Timer?
     private var fileWatcherSource: DispatchSourceFileSystemObject?
     private var fileDescriptor: Int32 = -1
     private let fileManager = FileManager.default
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
     
+    // Direct API usage cache
+    private var cachedOAuthToken: String?
+    private var directUsageSessionPercent: Int?
+    private var directUsageSessionReset: String?
+    private var directUsageWeeklyPercent: Int?
+    private var directUsageWeeklyReset: String?
+    private var isFetchingAPI: Bool = false
+    private var previousWasBusy: Bool = false
+    
     public init() {
         refresh()
         startMonitoring()
         setupLiveFileWatcher()
+        fetchDirectUsage()
     }
     
     public func startMonitoring() {
         timer?.invalidate()
-        // Poll every 1.5 seconds for sessions, status & active tools
+        // Fast timer (1.5s) for real-time session status & active tool animations
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refresh()
             }
         }
+        
+        apiTimer?.invalidate()
+        // Direct API poller (every 20s) to keep token limits 100% synchronized with Anthropic
+        apiTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.fetchDirectUsage()
+            }
+        }
+    }
+    
+    public func stopMonitoring() {
+        timer?.invalidate()
+        timer = nil
+        apiTimer?.invalidate()
+        apiTimer = nil
+        fileWatcherSource?.cancel()
+        fileWatcherSource = nil
+    }
+    
+    // MARK: - Direct Anthropic OAuth Live Usage API
+    
+    private func getOAuthToken() -> String? {
+        if let token = cachedOAuthToken, !token.isEmpty {
+            return token
+        }
+        
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let jsonData = output.data(using: .utf8) else {
+                return nil
+            }
+            let payload = try JSONDecoder().decode(KeychainOAuthPayload.self, from: jsonData)
+            self.cachedOAuthToken = payload.claudeAiOauth?.accessToken
+            return self.cachedOAuthToken
+        } catch {
+            return nil
+        }
+    }
+    
+    public func fetchDirectUsage() {
+        guard !isFetchingAPI else { return }
+        guard let token = getOAuthToken() else { return }
+        guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else { return }
+        
+        isFetchingAPI = true
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("claude-code", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 10.0
+        
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.isFetchingAPI = false
+                
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 401 {
+                    self.cachedOAuthToken = nil
+                    return
+                }
+                
+                guard let data = data,
+                      let decoded = try? JSONDecoder().decode(AnthropicUsageResponse.self, from: data) else {
+                    return
+                }
+                
+                if let fiveHour = decoded.five_hour, let u = fiveHour.utilization {
+                    let pct = u <= 1.0 && u > 0 ? (u * 100.0) : u
+                    self.directUsageSessionPercent = Int(round(pct))
+                    if let resets = fiveHour.resets_at {
+                        self.directUsageSessionReset = self.formatRelativeReset(resets)
+                    }
+                }
+                
+                if let sevenDay = decoded.seven_day, let u = sevenDay.utilization {
+                    let pct = u <= 1.0 && u > 0 ? (u * 100.0) : u
+                    self.directUsageWeeklyPercent = Int(round(pct))
+                    if let resets = sevenDay.resets_at {
+                        self.directUsageWeeklyReset = self.formatRelativeReset(resets)
+                    }
+                }
+                
+                self.refresh()
+            }
+        }.resume()
     }
     
     private func setupLiveFileWatcher() {
         let livePath = "\(homeDir)/.claude/live-usage.json"
         
-        // Ensure file exists so we can watch its descriptor
         if !fileManager.fileExists(atPath: livePath) {
             let emptyData = "{}".data(using: .utf8) ?? Data()
             try? emptyData.write(to: URL(fileURLWithPath: livePath))
@@ -60,17 +165,10 @@ public class ClaudeMonitor: ObservableObject {
         self.fileWatcherSource = source
     }
     
-    public func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-        fileWatcherSource?.cancel()
-        fileWatcherSource = nil
-    }
-    
     public func refresh() {
         var newInfo = ClaudeUsageInfo()
         
-        // 1. Read usage (first check live-usage.json, then cached fallback)
+        // 1. Read usage (Priority: Direct API -> live-usage.json -> ~/.claude.json)
         readUsage(into: &newInfo)
         
         // 2. Read active sessions from ~/.claude/sessions/
@@ -84,6 +182,16 @@ public class ClaudeMonitor: ObservableObject {
     }
     
     private func readUsage(into info: inout ClaudeUsageInfo) {
+        // Source 1: Direct Live API from Anthropic (Most accurate & real-time)
+        if let sPct = directUsageSessionPercent, let wPct = directUsageWeeklyPercent {
+            info.sessionPercent = sPct
+            if let r = directUsageSessionReset { info.sessionResetText = r }
+            info.weeklyPercent = wPct
+            if let r = directUsageWeeklyReset { info.weeklyResetText = r }
+            return
+        }
+        
+        // Source 2: live-usage.json file (if available and valid)
         let livePath = "\(homeDir)/.claude/live-usage.json"
         let now = Date().timeIntervalSince1970
         
@@ -140,16 +248,12 @@ public class ClaudeMonitor: ObservableObject {
                 }
             }
             
-            // Only return if at least one window is valid and not expired
             if validFiveHour || validSevenDay {
                 return
-            } else {
-                // If live data has completely expired, remove the stale file
-                try? fileManager.removeItem(atPath: livePath)
             }
         }
         
-        // Fallback: ~/.claude.json
+        // Source 3: ~/.claude.json fallback
         let configPath = "\(homeDir)/.claude.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)) else { return }
         
@@ -235,6 +339,12 @@ public class ClaudeMonitor: ObservableObject {
                 info.activeProject = session.name ?? "Claude Code"
             }
         }
+        
+        // If transitioning from busy to idle, Claude just completed work: refresh API usage
+        if previousWasBusy && !isAnySessionBusy {
+            fetchDirectUsage()
+        }
+        previousWasBusy = isAnySessionBusy
         
         if isAnySessionBusy {
             info.currentStatus = "busy"
