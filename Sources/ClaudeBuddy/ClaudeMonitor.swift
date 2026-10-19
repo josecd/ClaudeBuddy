@@ -85,40 +85,67 @@ public class ClaudeMonitor: ObservableObject {
     
     private func readUsage(into info: inout ClaudeUsageInfo) {
         let livePath = "\(homeDir)/.claude/live-usage.json"
+        let now = Date().timeIntervalSince1970
+        
         if fileManager.fileExists(atPath: livePath),
            let data = try? Data(contentsOf: URL(fileURLWithPath: livePath)),
            let live = try? JSONDecoder().decode(LiveUsageFile.self, from: data) {
             
-            var parsedAny = false
+            var validFiveHour = false
+            var validSevenDay = false
             
             if let fiveHour = live.five_hour, let u = fiveHour.utilization {
-                let pct = u <= 1.0 && u > 0 ? (u * 100.0) : u
-                info.sessionPercent = Int(round(pct))
-                if let resetsAtTimestamp = fiveHour.resetsAt {
-                    info.sessionResetText = formatRelativeResetTimestamp(resetsAtTimestamp)
-                } else if let resetsAtStr = fiveHour.resets_at {
-                    info.sessionResetText = formatRelativeReset(resetsAtStr)
+                let isExpired: Bool
+                if let ts = fiveHour.resetsAt {
+                    let targetSecs = ts > 100_000_000_000 ? (ts / 1000.0) : ts
+                    isExpired = targetSecs < now
                 } else {
-                    info.sessionResetText = "Activo"
+                    isExpired = false
                 }
-                parsedAny = true
+                
+                if !isExpired {
+                    let pct = u <= 1.0 && u > 0 ? (u * 100.0) : u
+                    info.sessionPercent = Int(round(pct))
+                    if let resetsAtTimestamp = fiveHour.resetsAt {
+                        info.sessionResetText = formatRelativeResetTimestamp(resetsAtTimestamp)
+                    } else if let resetsAtStr = fiveHour.resets_at {
+                        info.sessionResetText = formatRelativeReset(resetsAtStr)
+                    } else {
+                        info.sessionResetText = "Activo"
+                    }
+                    validFiveHour = true
+                }
             }
             
             if let sevenDay = live.seven_day, let u = sevenDay.utilization {
-                let pct = u <= 1.0 && u > 0 ? (u * 100.0) : u
-                info.weeklyPercent = Int(round(pct))
-                if let resetsAtTimestamp = sevenDay.resetsAt {
-                    info.weeklyResetText = formatRelativeResetTimestamp(resetsAtTimestamp)
-                } else if let resetsAtStr = sevenDay.resets_at {
-                    info.weeklyResetText = formatRelativeReset(resetsAtStr)
+                let isExpired: Bool
+                if let ts = sevenDay.resetsAt {
+                    let targetSecs = ts > 100_000_000_000 ? (ts / 1000.0) : ts
+                    isExpired = targetSecs < now
                 } else {
-                    info.weeklyResetText = "Activo"
+                    isExpired = false
                 }
-                parsedAny = true
+                
+                if !isExpired {
+                    let pct = u <= 1.0 && u > 0 ? (u * 100.0) : u
+                    info.weeklyPercent = Int(round(pct))
+                    if let resetsAtTimestamp = sevenDay.resetsAt {
+                        info.weeklyResetText = formatRelativeResetTimestamp(resetsAtTimestamp)
+                    } else if let resetsAtStr = sevenDay.resets_at {
+                        info.weeklyResetText = formatRelativeReset(resetsAtStr)
+                    } else {
+                        info.weeklyResetText = "Activo"
+                    }
+                    validSevenDay = true
+                }
             }
             
-            if parsedAny {
+            // Only return if at least one window is valid and not expired
+            if validFiveHour || validSevenDay {
                 return
+            } else {
+                // If live data has completely expired, remove the stale file
+                try? fileManager.removeItem(atPath: livePath)
             }
         }
         
